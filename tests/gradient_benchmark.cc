@@ -27,6 +27,7 @@ struct MethodSummary {
   ErrorMetrics fd_error;
   ErrorMetrics pair_error;
   double average_ns = 0.0;
+  double speedup_vs_analytic = 0.0;
 };
 
 std::string generated_library_path() {
@@ -63,32 +64,10 @@ int parse_iterations(int argc, char** argv) {
   return iterations;
 }
 
-GradientResult eval_cppadcg_generated_forward(CppAD::cg::GenericModel<double>& model, const DenseVector& x) {
-  GradientResult out;
-  out.gradient.assign(autodiff_benchmark::kDimension, 0.0);
-
-  DenseVector tx(2 * autodiff_benchmark::kDimension, 0.0);
-  for (std::size_t j = 0; j < autodiff_benchmark::kDimension; ++j) {
-    tx[2 * j] = x[j];
-  }
-  out.value = model.ForwardZero(x)[0];
-
-  for (std::size_t j = 0; j < autodiff_benchmark::kDimension; ++j) {
-    tx[2 * j + 1] = 1.0;
-    const auto dy = model.ForwardOne(tx);
-    out.gradient[j] = dy[0];
-    tx[2 * j + 1] = 0.0;
-  }
-
-  return out;
-}
-
-GradientResult eval_cppadcg_generated_reverse(CppAD::cg::GenericModel<double>& model, const DenseVector& x) {
+GradientResult eval_cppadcg_generated_jacobian(CppAD::cg::GenericModel<double>& model, const DenseVector& x) {
   GradientResult out;
   out.value = model.ForwardZero(x)[0];
-  DenseVector ty(1, out.value);
-  DenseVector weights(1, 1.0);
-  out.gradient = model.ReverseOne(x, ty, weights);
+  out.gradient = model.Jacobian(x);
   return out;
 }
 
@@ -118,8 +97,9 @@ void print_summary_header() {
             << std::setw(16) << "rms|g-g_fd|"
             << std::setw(16) << "max|g-g_ref|"
             << std::setw(16) << "avg ns"
+            << std::setw(12) << "speedup"
             << '\n';
-  std::cout << std::string(88, '-') << '\n';
+  std::cout << std::string(100, '-') << '\n';
 }
 
 void print_summary_row(const MethodSummary& summary) {
@@ -127,7 +107,8 @@ void print_summary_row(const MethodSummary& summary) {
             << std::right << std::setw(16) << std::scientific << std::setprecision(3) << summary.fd_error.max_abs
             << std::setw(16) << summary.fd_error.rms
             << std::setw(16) << summary.pair_error.max_abs
-            << std::setw(16) << std::fixed << std::setprecision(1) << summary.average_ns
+            << std::setw(16) << std::fixed << std::setprecision(2) << summary.average_ns
+            << std::setw(12) << std::setprecision(4) << summary.speedup_vs_analytic
             << '\n';
 }
 
@@ -155,16 +136,30 @@ int main(int argc, char** argv) {
 
     const GradientResult cppad_reverse = autodiff_benchmark::eval_cppad_reverse(cppad_fun, x);
     const GradientResult cppad_forward = autodiff_benchmark::eval_cppad_forward(cppad_fun, x);
-    const GradientResult cppadcg_reverse = eval_cppadcg_generated_reverse(*generated_model, x);
-    const GradientResult cppadcg_forward = eval_cppadcg_generated_forward(*generated_model, x);
+    const GradientResult cppadcg_jacobian = eval_cppadcg_generated_jacobian(*generated_model, x);
     const GradientResult tinyad_forward = autodiff_benchmark::eval_tinyad_forward(x);
+    const GradientResult analytic = autodiff_benchmark::eval_analytic_gradient(x);
+
+#ifdef AUTODIFF_HAS_ENZYME
+    const GradientResult enzyme_reverse = autodiff_benchmark::eval_enzyme_reverse(x);
+    const GradientResult enzyme_forward = autodiff_benchmark::eval_enzyme_forward(x);
+    const auto enzyme_reverse_pair = autodiff_benchmark::compute_error(enzyme_reverse.gradient, cppad_reverse.gradient);
+    const auto enzyme_forward_pair = autodiff_benchmark::compute_error(enzyme_forward.gradient, cppad_reverse.gradient);
+#endif
 
     const auto cppad_forward_pair = autodiff_benchmark::compute_error(cppad_forward.gradient, cppad_reverse.gradient);
-    const auto cppadcg_reverse_pair = autodiff_benchmark::compute_error(cppadcg_reverse.gradient, cppad_reverse.gradient);
-    const auto cppadcg_forward_pair = autodiff_benchmark::compute_error(cppadcg_forward.gradient, cppad_reverse.gradient);
+    const auto cppadcg_jacobian_pair = autodiff_benchmark::compute_error(cppadcg_jacobian.gradient, cppad_reverse.gradient);
     const auto tinyad_forward_pair = autodiff_benchmark::compute_error(tinyad_forward.gradient, cppad_reverse.gradient);
+    const auto analytic_pair = autodiff_benchmark::compute_error(analytic.gradient, cppad_reverse.gradient);
 
     std::vector<MethodSummary> summaries = {
+      {
+        "Analytic",
+        analytic,
+        autodiff_benchmark::compute_error(analytic.gradient, finite_diff),
+        analytic_pair,
+        benchmark_average_ns(iterations, [&] { return autodiff_benchmark::eval_analytic_gradient(x); })
+      },
       {
         "TinyAD forward",
         tinyad_forward,
@@ -187,20 +182,35 @@ int main(int argc, char** argv) {
         benchmark_average_ns(iterations, [&] { return autodiff_benchmark::eval_cppad_reverse(cppad_fun, x); })
       },
       {
-        "CppADCodegen forward",
-        cppadcg_forward,
-        autodiff_benchmark::compute_error(cppadcg_forward.gradient, finite_diff),
-        cppadcg_forward_pair,
-        benchmark_average_ns(iterations, [&] { return eval_cppadcg_generated_forward(*generated_model, x); })
+        "CppADCodegen Jacobian",
+        cppadcg_jacobian,
+        autodiff_benchmark::compute_error(cppadcg_jacobian.gradient, finite_diff),
+        cppadcg_jacobian_pair,
+        benchmark_average_ns(iterations, [&] { return eval_cppadcg_generated_jacobian(*generated_model, x); })
+      }
+#ifdef AUTODIFF_HAS_ENZYME
+      ,
+      {
+        "Enzyme reverse",
+        enzyme_reverse,
+        autodiff_benchmark::compute_error(enzyme_reverse.gradient, finite_diff),
+        enzyme_reverse_pair,
+        benchmark_average_ns(iterations, [&] { return autodiff_benchmark::eval_enzyme_reverse(x); })
       },
       {
-        "CppADCodegen reverse",
-        cppadcg_reverse,
-        autodiff_benchmark::compute_error(cppadcg_reverse.gradient, finite_diff),
-        cppadcg_reverse_pair,
-        benchmark_average_ns(iterations, [&] { return eval_cppadcg_generated_reverse(*generated_model, x); })
+        "Enzyme forward",
+        enzyme_forward,
+        autodiff_benchmark::compute_error(enzyme_forward.gradient, finite_diff),
+        enzyme_forward_pair,
+        benchmark_average_ns(iterations, [&] { return autodiff_benchmark::eval_enzyme_forward(x); })
       }
+#endif
     };
+
+    const double analytic_average_ns = summaries[0].average_ns;
+    for (auto& summary : summaries) {
+      summary.speedup_vs_analytic = analytic_average_ns / summary.average_ns;
+    }
 
     std::cout << "Gradient benchmark on a coupled objective with " << autodiff_benchmark::kDimension << " variables\n";
     std::cout << "Finite-difference step : " << std::scientific << autodiff_benchmark::kFiniteDiffStep << '\n';
@@ -221,8 +231,14 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "\n";
+    std::cout << "Analytic note: hand-derived closed-form gradient of the benchmark objective.\n";
     std::cout << "TinyAD note: only forward mode is available in this benchmark; reverse mode is not exposed by TinyAD.\n";
-    std::cout << "CppADCodegen note: timings measure the generated shared library built from cppadcg_benchmark_runtime/.\n";
+    std::cout << "CppADCodegen note: timings measure the generated dense Jacobian library built from cppadcg_benchmark_runtime/.\n";
+#ifdef AUTODIFF_HAS_ENZYME
+    std::cout << "Enzyme note: reverse mode uses a single reverse sweep (O(1) passes); forward mode uses N forward sweeps.\n";
+#else
+    std::cout << "Enzyme status: disabled at build time; configure tests with -DAUTODIFF_ENABLE_ENZYME=ON to include Enzyme timings.\n";
+#endif
 
     bool ok = true;
     std::ostringstream errors;
@@ -243,18 +259,29 @@ int main(int argc, char** argv) {
       ok = false;
       errors << "CppAD forward vs reverse mismatch " << cppad_forward_pair.max_abs << '\n';
     }
-    if (cppadcg_forward_pair.max_abs > autodiff_benchmark::kCrossTolerance) {
+    if (cppadcg_jacobian_pair.max_abs > autodiff_benchmark::kCrossTolerance) {
       ok = false;
-      errors << "CppADCodegen forward vs CppAD reverse mismatch " << cppadcg_forward_pair.max_abs << '\n';
-    }
-    if (cppadcg_reverse_pair.max_abs > autodiff_benchmark::kCrossTolerance) {
-      ok = false;
-      errors << "CppADCodegen reverse vs CppAD reverse mismatch " << cppadcg_reverse_pair.max_abs << '\n';
+      errors << "CppADCodegen Jacobian vs CppAD reverse mismatch " << cppadcg_jacobian_pair.max_abs << '\n';
     }
     if (tinyad_forward_pair.max_abs > autodiff_benchmark::kFiniteDiffTolerance) {
       ok = false;
       errors << "TinyAD forward vs CppAD reverse mismatch " << tinyad_forward_pair.max_abs << '\n';
     }
+    if (analytic_pair.max_abs > autodiff_benchmark::kCrossTolerance) {
+      ok = false;
+      errors << "Analytic vs CppAD reverse mismatch " << analytic_pair.max_abs << '\n';
+    }
+
+#ifdef AUTODIFF_HAS_ENZYME
+    if (enzyme_reverse_pair.max_abs > autodiff_benchmark::kCrossTolerance) {
+      ok = false;
+      errors << "Enzyme reverse vs CppAD reverse mismatch " << enzyme_reverse_pair.max_abs << '\n';
+    }
+    if (enzyme_forward_pair.max_abs > autodiff_benchmark::kCrossTolerance) {
+      ok = false;
+      errors << "Enzyme forward vs CppAD reverse mismatch " << enzyme_forward_pair.max_abs << '\n';
+    }
+#endif
 
     if (!ok) {
       std::cerr << "\nVerification failed:\n" << errors.str();

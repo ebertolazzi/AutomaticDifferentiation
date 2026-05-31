@@ -36,6 +36,7 @@ struct HessianMethodSummary {
   ErrorMetrics ref_error;
   double finite_diff_max = 0.0;
   double average_ns = 0.0;
+  double speedup_vs_analytic = 0.0;
 };
 
 std::string generated_library_path() {
@@ -157,8 +158,15 @@ HessianResult eval_tinyad_hessian(const DenseVector& x) {
 HessianResult eval_cppadcg_hessian(CppAD::cg::GenericModel<double>& model, const DenseVector& x) {
   HessianResult out;
   out.value = model.ForwardZero(x)[0];
-  DenseVector w(1, 1.0);
-  out.hessian = model.SparseHessian(x, w);
+  out.hessian = model.Hessian(x, 0);
+  return out;
+}
+
+HessianResult eval_analytic_hessian_result(const DenseVector& x) {
+  HessianResult out;
+  auto full = autodiff_benchmark::eval_analytic_full(x);
+  out.value   = full.value;
+  out.hessian = std::move(full.hessian);
   return out;
 }
 
@@ -187,8 +195,9 @@ void print_summary_header() {
             << std::setw(16) << "rms|H-H_ref|"
             << std::setw(16) << "max|H-H_fd|"
             << std::setw(16) << "avg ns"
+            << std::setw(12) << "speedup"
             << '\n';
-  std::cout << std::string(88, '-') << '\n';
+  std::cout << std::string(100, '-') << '\n';
 }
 
 void print_summary_row(const HessianMethodSummary& summary) {
@@ -196,7 +205,8 @@ void print_summary_row(const HessianMethodSummary& summary) {
             << std::right << std::setw(16) << std::scientific << std::setprecision(3) << summary.ref_error.max_abs
             << std::setw(16) << summary.ref_error.rms
             << std::setw(16) << summary.finite_diff_max
-            << std::setw(16) << std::fixed << std::setprecision(1) << summary.average_ns
+            << std::setw(16) << std::fixed << std::setprecision(2) << summary.average_ns
+            << std::setw(12) << std::setprecision(4) << summary.speedup_vs_analytic
             << '\n';
 }
 
@@ -224,8 +234,24 @@ int main(int argc, char** argv) {
     const HessianResult cppad_hessian = eval_cppad_hessian(cppad_fun, x);
     const HessianResult tinyad_hessian = eval_tinyad_hessian(x);
     const HessianResult cppadcg_hessian = eval_cppadcg_hessian(*generated_model, x);
+    const HessianResult analytic_hessian = eval_analytic_hessian_result(x);
+
+#ifdef AUTODIFF_HAS_ENZYME
+    // Enzyme forward-over-reverse Hessian
+    const auto enzyme_full = autodiff_benchmark::eval_enzyme_full(x);
+    HessianResult enzyme_hessian;
+    enzyme_hessian.value   = enzyme_full.value;
+    enzyme_hessian.hessian = enzyme_full.hessian;
+#endif
 
     std::vector<HessianMethodSummary> summaries = {
+      {
+        "Analytic",
+        analytic_hessian,
+        compute_dense_error(analytic_hessian.hessian, cppad_hessian.hessian),
+        max_probe_error(x, analytic_hessian.hessian),
+        benchmark_average_ns(iterations, [&] { return eval_analytic_hessian_result(x); })
+      },
       {
         "TinyAD Hessian",
         tinyad_hessian,
@@ -247,7 +273,28 @@ int main(int argc, char** argv) {
         max_probe_error(x, cppadcg_hessian.hessian),
         benchmark_average_ns(iterations, [&] { return eval_cppadcg_hessian(*generated_model, x); })
       }
+#ifdef AUTODIFF_HAS_ENZYME
+      ,
+      {
+        "Enzyme Hessian",
+        enzyme_hessian,
+        compute_dense_error(enzyme_hessian.hessian, cppad_hessian.hessian),
+        max_probe_error(x, enzyme_hessian.hessian),
+        benchmark_average_ns(iterations, [&] {
+          auto ef = autodiff_benchmark::eval_enzyme_full(x);
+          HessianResult r;
+          r.value   = ef.value;
+          r.hessian = std::move(ef.hessian);
+          return r;
+        })
+      }
+#endif
     };
+
+    const double analytic_average_ns = summaries[0].average_ns;
+    for (auto& summary : summaries) {
+      summary.speedup_vs_analytic = analytic_average_ns / summary.average_ns;
+    }
 
     std::cout << "Hessian benchmark on a coupled objective with " << autodiff_benchmark::kDimension << " variables\n";
     std::cout << "Finite-difference step : " << std::scientific << kFiniteDiffHessianStep << '\n';
@@ -268,8 +315,14 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "\n";
+    std::cout << "Analytic note: hand-derived closed-form Hessian of the benchmark objective.\n";
     std::cout << "TinyAD note: Hessian is computed in forward mode through TinyAD::Scalar with second-order derivatives.\n";
-    std::cout << "CppADCodegen note: Hessian timings measure the generated shared library built from cppadcg_hessian_runtime/.\n";
+    std::cout << "CppADCodegen note: Hessian timings measure the generated dense Hessian library built from cppadcg_hessian_runtime/.\n";
+#ifdef AUTODIFF_HAS_ENZYME
+    std::cout << "Enzyme note: Hessian is computed via reverse-over-forward, one reverse sweep per gradient component.\n";
+#else
+    std::cout << "Enzyme status: disabled at build time; configure tests with -DAUTODIFF_ENABLE_ENZYME=ON to include Enzyme timings.\n";
+#endif
 
     bool ok = true;
     std::ostringstream errors;
@@ -286,14 +339,26 @@ int main(int argc, char** argv) {
       }
     }
 
+    if (summaries[1].ref_error.max_abs > autodiff_benchmark::kCrossTolerance) {
+      ok = false;
+      errors << "TinyAD Hessian vs CppAD mismatch " << summaries[1].ref_error.max_abs << '\n';
+    }
+    if (summaries[3].ref_error.max_abs > autodiff_benchmark::kCrossTolerance) {
+      ok = false;
+      errors << "CppADCodegen Hessian vs CppAD mismatch " << summaries[3].ref_error.max_abs << '\n';
+    }
     if (summaries[0].ref_error.max_abs > autodiff_benchmark::kCrossTolerance) {
       ok = false;
-      errors << "TinyAD Hessian vs CppAD mismatch " << summaries[0].ref_error.max_abs << '\n';
+      errors << "Analytic Hessian vs CppAD mismatch " << summaries[0].ref_error.max_abs << '\n';
     }
-    if (summaries[2].ref_error.max_abs > autodiff_benchmark::kCrossTolerance) {
+
+#ifdef AUTODIFF_HAS_ENZYME
+    // Enzyme is the last entry when enabled (index 4)
+    if (summaries.size() > 4 && summaries[4].ref_error.max_abs > autodiff_benchmark::kCrossTolerance) {
       ok = false;
-      errors << "CppADCodegen Hessian vs CppAD mismatch " << summaries[2].ref_error.max_abs << '\n';
+      errors << "Enzyme Hessian vs CppAD mismatch " << summaries[4].ref_error.max_abs << '\n';
     }
+#endif
 
     if (!ok) {
       std::cerr << "\nVerification failed:\n" << errors.str();

@@ -7,11 +7,16 @@
 #include <cppad/cppad.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
+
+#ifdef AUTODIFF_HAS_ENZYME
+#include <enzyme/utils>
+#endif
 
 namespace autodiff_benchmark {
 
@@ -240,5 +245,367 @@ inline GradientResult eval_tinyad_forward(const DenseVector& x) {
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Analytic gradient and Hessian of coupled_objective
+// ---------------------------------------------------------------------------
+
+inline GradientResult eval_analytic_gradient(const DenseVector& x) {
+  const std::size_t N = kDimension;
+  const double inv_n = 1.0 / static_cast<double>(N);
+
+  GradientResult out;
+  out.value = passive_objective(x);
+  out.gradient.assign(N, 0.0);
+
+  for (std::size_t i = 0; i < N; ++i) {
+    const std::size_t idx0 = i;
+    const std::size_t idx1 = (i +  1) % N;
+    const std::size_t idx2 = (i +  3) % N;
+    const std::size_t idx3 = (i +  7) % N;
+    const std::size_t idx4 = (i + 11) % N;
+    const std::size_t idx5 = (i + 19) % N;
+
+    const double x0 = x[idx0];
+    const double x1 = x[idx1];
+    const double x2 = x[idx2];
+    const double x3 = x[idx3];
+    const double x4 = x[idx4];
+    const double x5 = x[idx5];
+
+    const double e05x0       = std::exp(0.05 * x0);
+    const double arg_s       = x0 + 0.25 * x1;
+    const double sin_s       = std::sin(arg_s);
+    const double cos_s       = std::cos(arg_s);
+    const double arg_c       = x2 - 0.15 * x3;
+    const double cos_c       = std::cos(arg_c);
+    const double sin_c       = std::sin(arg_c);
+
+    const double affine      = x0 + 0.10 * x1 - 0.05 * x2;
+    const double log_denom   = 1.0 + x0 * x0 + 0.20 * x4 * x4;
+    const double log_t       = std::log(log_denom);
+
+    const double left        = x0 - 0.50 * x4;
+    const double right       = x1 + 0.20 * x5;
+
+    const double sin_x0x3   = std::sin(x0 * x3);
+    const double cos_x0x3   = std::cos(x0 * x3);
+    const double exp_03x5   = std::exp(0.03 * x5);
+
+    const double dtrig_dx0  = 0.05 * e05x0 * sin_s + e05x0 * cos_s;
+    const double dtrig_dx1  = e05x0 * cos_s * 0.25;
+    const double dtrig_dx2  = -0.35 * sin_c;
+    const double dtrig_dx3  =  0.35 * sin_c * 0.15;
+
+    const double daffine_dx0 =  1.0;
+    const double daffine_dx1 =  0.10;
+    const double daffine_dx2 = -0.05;
+    const double dlog_dx0   = 2.0 * x0 / log_denom;
+    const double dlog_dx4   = 0.40 * x4 / log_denom;
+
+    const double dmix_dx0   = 2.0 * affine * daffine_dx0 * log_t + affine * affine * dlog_dx0;
+    const double dmix_dx1   = 2.0 * affine * daffine_dx1 * log_t;
+    const double dmix_dx2   = 2.0 * affine * daffine_dx2 * log_t;
+    const double dmix_dx4   = affine * affine * dlog_dx4;
+
+    const double dcross_dx0 = 0.02 * cos_x0x3 * x3 * exp_03x5;
+    const double dcross_dx3 = 0.02 * cos_x0x3 * x0 * exp_03x5;
+    const double dcross_dx5 = 0.02 * sin_x0x3 * exp_03x5 * 0.03;
+
+    const double dquartic_dx0 = 0.01 * 2.0 * left * right * right;
+    const double dquartic_dx1 = 0.01 * left * left * 2.0 * right;
+    const double dquartic_dx4 = 0.01 * 2.0 * left * (-0.50) * right * right;
+    const double dquartic_dx5 = 0.01 * left * left * 2.0 * right * 0.20;
+
+    out.gradient[idx0] += inv_n * (dtrig_dx0 + dmix_dx0 + dcross_dx0 + dquartic_dx0);
+    out.gradient[idx1] += inv_n * (dtrig_dx1 + dmix_dx1 + dquartic_dx1);
+    out.gradient[idx2] += inv_n * (dtrig_dx2 + dmix_dx2);
+    out.gradient[idx3] += inv_n * (dtrig_dx3 + dcross_dx3);
+    out.gradient[idx4] += inv_n * (dmix_dx4 + dquartic_dx4);
+    out.gradient[idx5] += inv_n * (dcross_dx5 + dquartic_dx5);
+  }
+
+  return out;
+}
+
+inline std::vector<double> eval_analytic_hessian_matrix(const DenseVector& x) {
+  const std::size_t N = kDimension;
+  const double inv_n = 1.0 / static_cast<double>(N);
+  std::vector<double> H(N * N, 0.0);
+
+  const auto addH = [&](std::size_t r, std::size_t c, double v) {
+    if (r == c) {
+      H[r * N + c] += v;
+    } else {
+      H[r * N + c] += v;
+      H[c * N + r] += v;
+    }
+  };
+
+  for (std::size_t i = 0; i < N; ++i) {
+    const std::size_t idx0 = i;
+    const std::size_t idx1 = (i +  1) % N;
+    const std::size_t idx2 = (i +  3) % N;
+    const std::size_t idx3 = (i +  7) % N;
+    const std::size_t idx4 = (i + 11) % N;
+    const std::size_t idx5 = (i + 19) % N;
+
+    const double x0 = x[idx0];
+    const double x1 = x[idx1];
+    const double x2 = x[idx2];
+    const double x3 = x[idx3];
+    const double x4 = x[idx4];
+    const double x5 = x[idx5];
+
+    const double e05x0     = std::exp(0.05 * x0);
+    const double arg_s     = x0 + 0.25 * x1;
+    const double sin_s     = std::sin(arg_s);
+    const double cos_s     = std::cos(arg_s);
+    const double arg_c     = x2 - 0.15 * x3;
+    const double sin_c     = std::sin(arg_c);
+    const double cos_c     = std::cos(arg_c);
+
+    const double affine    = x0 + 0.10 * x1 - 0.05 * x2;
+    const double log_denom = 1.0 + x0 * x0 + 0.20 * x4 * x4;
+    const double log_t     = std::log(log_denom);
+
+    const double left      = x0 - 0.50 * x4;
+    const double right     = x1 + 0.20 * x5;
+
+    const double sin_x0x3 = std::sin(x0 * x3);
+    const double cos_x0x3 = std::cos(x0 * x3);
+    const double exp_03x5 = std::exp(0.03 * x5);
+
+    const double dlog_dx0 = 2.0 * x0 / log_denom;
+    const double dlog_dx4 = 0.40 * x4 / log_denom;
+
+    // trig second derivatives
+    addH(idx0, idx0, inv_n * e05x0 * ((0.0025 - 1.0) * sin_s + 0.10 * cos_s));
+    addH(idx0, idx1, inv_n * 0.25 * e05x0 * (0.05 * cos_s - sin_s));
+    addH(idx1, idx1, inv_n * (-0.0625) * e05x0 * sin_s);
+    addH(idx2, idx2, inv_n * 0.35 * (-cos_c));
+    addH(idx2, idx3, inv_n * 0.35 * 0.15 * cos_c);
+    addH(idx3, idx3, inv_n * (-0.35 * 0.0225 * cos_c));
+
+    // mix second derivatives
+    const double d2log_dx0x0 = (2.0 * log_denom - 4.0 * x0 * x0) / (log_denom * log_denom);
+    const double d2log_dx4x4 = 0.40 * (log_denom - 0.40 * x4 * x4) / (log_denom * log_denom);
+    const double d2log_dx0x4 = -2.0 * x0 * dlog_dx4 / log_denom;
+
+    struct Role { std::size_t idx; double dA; double dL; };
+    const Role roles[6] = {
+      {idx0,  1.00, dlog_dx0},
+      {idx1,  0.10, 0.0},
+      {idx2, -0.05, 0.0},
+      {idx3,  0.0,  0.0},
+      {idx4,  0.0,  dlog_dx4},
+      {idx5,  0.0,  0.0},
+    };
+    auto d2log = [&](int ra, int rb) -> double {
+      if (ra == 0 && rb == 0) return d2log_dx0x0;
+      if (ra == 4 && rb == 4) return d2log_dx4x4;
+      if ((ra == 0 && rb == 4) || (ra == 4 && rb == 0)) return d2log_dx0x4;
+      return 0.0;
+    };
+    for (int ra = 0; ra < 6; ++ra) {
+      for (int rb = ra; rb < 6; ++rb) {
+        double v = 2.0 * roles[ra].dA * roles[rb].dA * log_t
+                 + 2.0 * affine * roles[ra].dA * roles[rb].dL
+                 + 2.0 * affine * roles[rb].dA * roles[ra].dL
+                 + affine * affine * d2log(ra, rb);
+        if (v != 0.0) addH(roles[ra].idx, roles[rb].idx, inv_n * v);
+      }
+    }
+
+    // cross second derivatives
+    addH(idx0, idx0, inv_n * 0.02 * (-sin_x0x3) * x3 * x3 * exp_03x5);
+    addH(idx0, idx3, inv_n * 0.02 * (cos_x0x3 - sin_x0x3 * x0 * x3) * exp_03x5);
+    addH(idx0, idx5, inv_n * 0.02 * cos_x0x3 * x3 * exp_03x5 * 0.03);
+    addH(idx3, idx3, inv_n * 0.02 * (-sin_x0x3) * x0 * x0 * exp_03x5);
+    addH(idx3, idx5, inv_n * 0.02 * cos_x0x3 * x0 * exp_03x5 * 0.03);
+    addH(idx5, idx5, inv_n * 0.02 * sin_x0x3 * exp_03x5 * 0.0009);
+
+    // quartic second derivatives
+    addH(idx0, idx0, inv_n * 0.02 * right * right);
+    addH(idx0, idx1, inv_n * 0.04 * left * right);
+    addH(idx0, idx4, inv_n * (-0.01) * right * right);
+    addH(idx0, idx5, inv_n * 0.02 * left * 2.0 * right * 0.20);
+    addH(idx1, idx1, inv_n * 0.02 * left * left);
+    addH(idx1, idx4, inv_n * (-0.02) * left * right);
+    addH(idx1, idx5, inv_n * 0.004 * left * left);
+    addH(idx4, idx4, inv_n * 0.005 * right * right);
+    addH(idx4, idx5, inv_n * (-0.004) * left * right);
+    addH(idx5, idx5, inv_n * 0.0008 * left * left);
+  }
+  return H;
+}
+
+struct HessianResultAnalytic {
+  double value = 0.0;
+  DenseVector hessian;
+  DenseVector gradient;
+};
+
+inline HessianResultAnalytic eval_analytic_full(const DenseVector& x) {
+  HessianResultAnalytic out;
+  auto gr = eval_analytic_gradient(x);
+  out.value    = gr.value;
+  out.gradient = std::move(gr.gradient);
+  out.hessian  = eval_analytic_hessian_matrix(x);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Enzyme AD
+// ---------------------------------------------------------------------------
+#ifdef AUTODIFF_HAS_ENZYME
+
+extern int __enzyme_autodiff(...);
+extern double __enzyme_fwddiff(...);
+
+#ifndef AUTODIFF_ENZYME_IMPL_DEFINED
+#define AUTODIFF_ENZYME_IMPL_DEFINED
+
+inline double enzyme_objective_raw(const double* x, std::size_t n) noexcept {
+  (void)n;
+  return coupled_objective<double>([&](std::size_t i) -> const double& { return x[i]; });
+}
+
+#endif
+
+inline GradientResult eval_enzyme_reverse(const DenseVector& x) {
+  const std::size_t n = x.size();
+  GradientResult out;
+  out.value = passive_objective(x);
+  out.gradient.assign(n, 0.0);
+  __enzyme_autodiff(
+      reinterpret_cast<void*>(enzyme_objective_raw),
+      enzyme_dup,   x.data(), out.gradient.data(),
+      enzyme_const, n);
+  return out;
+}
+
+inline GradientResult eval_enzyme_forward(const DenseVector& x) {
+  const std::size_t n = x.size();
+  GradientResult out;
+  out.gradient.resize(n);
+  out.value = enzyme_objective_raw(x.data(), n);
+  for (std::size_t j = 0; j < n; ++j) {
+    DenseVector ej(n, 0.0);
+    ej[j] = 1.0;
+    out.gradient[j] = __enzyme_fwddiff(
+        reinterpret_cast<void*>(enzyme_objective_raw),
+        enzyme_dup,   x.data(), ej.data(),
+        enzyme_const, n);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Gradient helper
+// ---------------------------------------------------------------------------
+
+inline void enzyme_gradient_raw(
+  const double* x,
+  double* grad,
+  std::size_t n
+) noexcept {
+
+  std::fill_n(grad, n, 0.0);
+
+  __enzyme_autodiff(
+    reinterpret_cast<void*>(enzyme_objective_raw),
+    enzyme_dup,
+      const_cast<double*>(x),
+      grad,
+    enzyme_const,
+      n
+  );
+}
+
+inline double enzyme_gradient_component_raw(
+  const double* x,
+  std::size_t n,
+  std::size_t component
+) noexcept {
+
+  std::array<double, kDimension> grad{};
+
+  enzyme_gradient_raw(
+    x,
+    grad.data(),
+    n
+  );
+
+  return grad[component];
+}
+
+// ---------------------------------------------------------------------------
+// Hessian (Forward-over-Reverse)
+// ---------------------------------------------------------------------------
+
+inline DenseVector eval_enzyme_hessian(
+  const DenseVector& x
+) {
+
+  const std::size_t n = x.size();
+
+  DenseVector H(n * n, 0.0);
+
+  DenseVector direction(n, 0.0);
+
+  for (std::size_t j = 0; j < n; ++j) {
+
+    std::fill(
+      direction.begin(),
+      direction.end(),
+      0.0
+    );
+
+    direction[j] = 1.0;
+
+    for (std::size_t i = 0; i < n; ++i) {
+
+      H[i * n + j] =
+        __enzyme_fwddiff(
+          reinterpret_cast<void*>(
+            enzyme_gradient_component_raw
+          ),
+
+          enzyme_dup,
+            const_cast<double*>(x.data()),
+            direction.data(),
+
+          enzyme_const,
+            n,
+
+          enzyme_const,
+            i
+        );
+    }
+  }
+
+  return H;
+}
+
+// ---------------------------------------------------------------------------
+// Full result with Hessian (reverse-over-reverse, kept for compatibility)
+// ---------------------------------------------------------------------------
+struct EnzymeHessianResult {
+  double value = 0.0;
+  DenseVector gradient;
+  DenseVector hessian;
+};
+
+inline EnzymeHessianResult eval_enzyme_full(const DenseVector& x) {
+  EnzymeHessianResult out;
+  auto gr = eval_enzyme_reverse(x);
+  out.value    = gr.value;
+  out.gradient = std::move(gr.gradient);
+  out.hessian  = eval_enzyme_hessian(x);
+  return out;
+}
+
+#endif  // AUTODIFF_HAS_ENZYME
 
 }  // namespace autodiff_benchmark

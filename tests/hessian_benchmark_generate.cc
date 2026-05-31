@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -66,7 +67,11 @@ void write_runtime_cmakelists(const std::filesystem::path& out_dir, const std::s
     << "project(" << output_name << " LANGUAGES C)\n\n"
     << "file(GLOB CPPADCG_GENERATED_SOURCES CONFIGURE_DEPENDS \"${CMAKE_CURRENT_SOURCE_DIR}/*.c\")\n"
     << "add_library(" << output_name << " SHARED ${CPPADCG_GENERATED_SOURCES})\n"
-    << "target_compile_options(" << output_name << " PRIVATE -O3 -DNDEBUG)\n"
+    << "target_compile_options(" << output_name << " PRIVATE\n"
+    << "  $<$<OR:$<C_COMPILER_ID:GNU>,$<C_COMPILER_ID:Clang>>:-O2>\n"
+    << "  $<$<C_COMPILER_ID:MSVC>:/O2>\n"
+    << ")\n"
+    << "target_compile_definitions(" << output_name << " PRIVATE NDEBUG)\n"
     << "set_target_properties(" << output_name << " PROPERTIES\n"
     << "  OUTPUT_NAME \"" << output_name << "\"\n"
     << "  LIBRARY_OUTPUT_DIRECTORY \"${CMAKE_BINARY_DIR}\"\n"
@@ -106,11 +111,12 @@ int main(int argc, char** argv) {
 
     ModelCSourceGen<double> cgen(fun, name);
     cgen.setCreateForwardZero(true);
-    cgen.setCreateReverseTwo(true);
-    cgen.setCreateSparseHessian(true);
-    cgen.setCreateReverseOne(true);
+    cgen.setCreateHessian(true);
+    cgen.setMaxAssignmentsPerFunc(0);
+    cgen.setMaxOperationsPerAssignment((std::numeric_limits<size_t>::max)());
 
     ModelLibraryCSourceGen<double> libgen(cgen);
+    libgen.setMultiThreading(MultiThreadingType::NONE);
     SaveFilesModelLibraryProcessor<double>::saveLibrarySourcesTo(libgen, out_dir.string());
 
     write_runtime_cmakelists(out_dir, name);

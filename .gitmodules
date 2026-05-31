@@ -7,3 +7,9 @@
 [submodule "cmake_utils"]
 	path = cmake_utils
 	url = git@github.com:ebertolazzi/cmake_utils.git
+[submodule "submodules/TinyAD"]
+	path = submodules/TinyAD
+	url = git@github.com:ebertolazzi/TinyAD.git
+[submodule "submodules/Eigen5"]
+	path = submodules/Eigen5
+	url = https://gitlab.com/libeigen/eigen

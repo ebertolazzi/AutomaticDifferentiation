@@ -14,6 +14,26 @@ DEFAULT_CMAKE     = ENV.fetch("CMAKE", "cmake")
 DEFAULT_CXX_STANDARD = ENV.fetch("AUTODIFF_CXX_STANDARD", "17")
 
 COMPONENTS = {
+  eigen5: {
+    label: "Eigen5",
+    source: File.join(ROOTDIR, "submodules", "Eigen5"),
+    build:  "Eigen5",
+    cmake_args: lambda {
+      [
+        "-DCMAKE_INSTALL_PREFIX=#{prefix_dir}",
+        "-DCMAKE_CXX_STANDARD=#{DEFAULT_CXX_STANDARD}",
+        "-DCMAKE_CXX_STANDARD_REQUIRED=ON",
+        "-DBUILD_TESTING=OFF",
+        "-DEIGEN_BUILD_TESTING=OFF",
+        "-DEIGEN_BUILD_DOC=OFF",
+        "-DEIGEN_BUILD_DEMOS=OFF",
+        "-DEIGEN_BUILD_BLAS=OFF",
+        "-DEIGEN_BUILD_LAPACK=OFF",
+        "-DEIGEN_BUILD_PKGCONFIG=ON",
+        "-DEIGEN_BUILD_CMAKE_PACKAGE=ON"
+      ] + extra_cmake_args("EIGEN5_CMAKE_ARGS")
+    }
+  },
   cppad: {
     label: "CppAd",
     source: File.join(ROOTDIR, "submodules", "CppAd"),
@@ -25,7 +45,8 @@ COMPONENTS = {
         "-Dcmake_install_libdirs=lib",
         "-Dcppad_static_lib=#{cppad_static_lib}",
         "-DCMAKE_CXX_STANDARD=#{DEFAULT_CXX_STANDARD}",
-        "-DCMAKE_CXX_STANDARD_REQUIRED=ON"
+        "-DCMAKE_CXX_STANDARD_REQUIRED=ON",
+        "-DCMAKE_PREFIX_PATH=#{cmake_prefix_path}"
       ] + extra_cmake_args("CPPAD_CMAKE_ARGS")
     }
   },
@@ -38,11 +59,33 @@ COMPONENTS = {
         "-DCMAKE_INSTALL_PREFIX=#{prefix_dir}",
         "-DCPPAD_HOME=#{prefix_dir}",
         "-DCMAKE_CXX_STANDARD=#{DEFAULT_CXX_STANDARD}",
-        "-DCMAKE_CXX_STANDARD_REQUIRED=ON"
+        "-DCMAKE_CXX_STANDARD_REQUIRED=ON",
+        "-DCMAKE_PREFIX_PATH=#{cmake_prefix_path}"
       ] + extra_cmake_args("CPPADCG_CMAKE_ARGS")
     },
     env: lambda {
-      { "CPPAD_HOME" => prefix_dir }
+      {
+        "CPPAD_HOME" => prefix_dir,
+        "CMAKE_PREFIX_PATH" => cmake_prefix_path
+      }
+    }
+  },
+  tinyad: {
+    label: "TinyAD",
+    source: File.join(ROOTDIR, "submodules", "TinyAD"),
+    build:  "TinyAD",
+    kind:   :header_only,
+    cmake_check: true,
+    include_dir: File.join(ROOTDIR, "submodules", "TinyAD", "include"),
+    cmake_args: lambda {
+      [
+        "-DCMAKE_CXX_STANDARD=#{DEFAULT_CXX_STANDARD}",
+        "-DCMAKE_CXX_STANDARD_REQUIRED=ON",
+        "-DCMAKE_PREFIX_PATH=#{cmake_prefix_path}",
+        "-DEigen3_DIR=#{eigen3_cmake_dir}",
+        "-DTINYAD_UNIT_TESTS=OFF",
+        "-DBUILD_TESTING=OFF"
+      ] + extra_cmake_args("TINYAD_CMAKE_ARGS")
     }
   }
 }.freeze
@@ -53,6 +96,30 @@ end
 
 def build_root
   File.expand_path(ENV.fetch("AUTODIFF_BUILDDIR", DEFAULT_BUILDDIR), ROOTDIR)
+end
+
+def tests_source_dir
+  File.join(ROOTDIR, "tests")
+end
+
+def tests_build_dir
+  File.join(build_root, "tests")
+end
+
+def tests_codegen_gradient_dir
+  File.join(tests_source_dir, "cppadcg_benchmark_runtime")
+end
+
+def tests_codegen_hessian_dir
+  File.join(tests_source_dir, "cppadcg_hessian_runtime")
+end
+
+def cmake_prefix_path
+  [prefix_dir, ENV.fetch("CMAKE_PREFIX_PATH", nil)].compact.reject(&:empty?).join(";")
+end
+
+def eigen3_cmake_dir
+  File.join(prefix_dir, "share", "eigen3", "cmake")
 end
 
 def component_source(name)
@@ -98,11 +165,25 @@ def ensure_command!(command)
 end
 
 def ensure_component!(name)
+  spec = COMPONENTS.fetch(name)
   source_dir = component_source(name)
   cmake_file = File.join(source_dir, "CMakeLists.txt")
 
   raise RuntimeError, "Missing source directory #{source_dir}".red unless Dir.exist?(source_dir)
-  raise RuntimeError, "Missing #{cmake_file}".red unless File.exist?(cmake_file)
+  if spec[:kind] == :header_only
+    include_dir = spec[:include_dir]
+    raise RuntimeError, "Missing include directory #{include_dir}".red unless Dir.exist?(include_dir)
+    if spec[:cmake_check]
+      raise RuntimeError, "Missing #{cmake_file}".red unless File.exist?(cmake_file)
+    end
+  else
+    raise RuntimeError, "Missing #{cmake_file}".red unless File.exist?(cmake_file)
+  end
+end
+
+def component_needs_configure?(name)
+  spec = COMPONENTS.fetch(name)
+  spec[:kind] != :header_only || spec[:cmake_check]
 end
 
 def component_status(name)
@@ -117,8 +198,12 @@ def environment_overrides
     CMAKE
     CMAKE_GENERATOR
     CMAKE_ARGS
+    EIGEN5_CMAKE_ARGS
     CPPAD_CMAKE_ARGS
     CPPADCG_CMAKE_ARGS
+    TINYAD_CMAKE_ARGS
+    AUTODIFF_TEST_CMAKE_ARGS
+    AUTODIFF_BENCH_ARGS
   ].filter_map do |key|
     next unless ENV.key?(key)
 
@@ -149,9 +234,13 @@ def print_configuration
     ["generator", DEFAULT_GENERATOR],
     ["cmake", DEFAULT_CMAKE],
     ["cxx_standard", DEFAULT_CXX_STANDARD],
+    ["eigen3_dir", eigen3_cmake_dir],
+    ["cmake_prefix_path", cmake_prefix_path],
     ["parallel", PARALLEL.strip.empty? ? "disabled" : PARALLEL.strip],
     ["prefix", prefix_dir],
-    ["build_root", build_root]
+    ["build_root", build_root],
+    ["tests_source", tests_source_dir],
+    ["tests_build", tests_build_dir]
   ]
 
   component_rows = COMPONENTS.map do |name, spec|
@@ -169,6 +258,8 @@ end
 
 def configure_component(name)
   ensure_component!(name)
+  return unless component_needs_configure?(name)
+
   ensure_command!(DEFAULT_CMAKE)
 
   source_dir = component_source(name)
@@ -191,7 +282,25 @@ def configure_component(name)
   )
 end
 
+def install_header_only_component(name)
+  spec        = COMPONENTS.fetch(name)
+  include_dir = spec[:include_dir]
+  dest_dir    = File.join(prefix_dir, "include")
+
+  raise RuntimeError, "Include directory #{include_dir} does not exist".red unless Dir.exist?(include_dir)
+
+  FileUtils.mkdir_p dest_dir
+
+  puts "Install #{spec[:label]}".green
+  FileUtils.cp_r File.join(include_dir, "."), dest_dir
+end
+
 def install_component(name)
+  if COMPONENTS.fetch(name)[:kind] == :header_only
+    install_header_only_component(name)
+    return
+  end
+
   build_dir = component_build_dir(name)
   env       = COMPONENTS.fetch(name).fetch(:env, -> { {} }).call
 
@@ -214,15 +323,115 @@ def build_component(name)
   install_component(name)
 end
 
+def ensure_tests_project!
+  cmake_file = File.join(tests_source_dir, "CMakeLists.txt")
+
+  raise RuntimeError, "Missing tests directory #{tests_source_dir}".red unless Dir.exist?(tests_source_dir)
+  raise RuntimeError, "Missing #{cmake_file}".red unless File.exist?(cmake_file)
+end
+
+def configure_tests_project
+  ensure_tests_project!
+  ensure_command!(DEFAULT_CMAKE)
+
+  FileUtils.mkdir_p tests_build_dir
+
+  puts "Configure tests".green
+  run_command(
+    [
+      DEFAULT_CMAKE,
+      "-S", tests_source_dir,
+      "-B", tests_build_dir,
+      "-G", DEFAULT_GENERATOR,
+      "-DCMAKE_BUILD_TYPE=#{build_type}",
+      "-DAUTODIFF_PREFIX=#{prefix_dir}",
+      "-DCMAKE_PREFIX_PATH=#{cmake_prefix_path}",
+      "-DEigen3_DIR=#{eigen3_cmake_dir}"
+    ] + extra_cmake_args("AUTODIFF_TEST_CMAKE_ARGS")
+  )
+end
+
+def build_tests_project
+  configure_tests_project
+
+  puts "Build tests".green
+  run_command(
+    [
+      DEFAULT_CMAKE,
+      "--build", tests_build_dir,
+      "--config", build_type
+    ] + Shellwords.split(PARALLEL)
+  )
+end
+
+def tests_executable_candidates
+  tests_executable_candidates_for("autodiff_gradient_benchmark")
+end
+
+def tests_executable_candidates_for(base_name)
+  exe = Gem.win_platform? ? "#{base_name}.exe" : base_name
+
+  [
+    File.join(tests_build_dir, exe),
+    File.join(tests_build_dir, build_type, exe)
+  ]
+end
+
+def tests_executable_path
+  tests_executable_candidates.find { |path| File.exist?(path) } || tests_executable_candidates.first
+end
+
+def tests_executable_path_for(base_name)
+  candidates = tests_executable_candidates_for(base_name)
+  candidates.find { |path| File.exist?(path) } || candidates.first
+end
+
+def run_tests_project
+  build_tests_project
+
+  puts "Run tests".green
+  run_command(
+    [
+      DEFAULT_CMAKE,
+      "--test-dir", tests_build_dir,
+      "--build-config", build_type,
+      "--output-on-failure"
+    ]
+  )
+end
+
+def run_benchmark
+  run_benchmark_for("autodiff_gradient_benchmark", "gradient benchmark")
+end
+
+def run_hessian_benchmark
+  run_benchmark_for("autodiff_hessian_benchmark", "hessian benchmark")
+end
+
+def run_benchmark_for(base_name, label)
+  build_tests_project
+
+  exe_path = tests_executable_path_for(base_name)
+  raise RuntimeError, "Cannot find #{label} executable #{exe_path}".red unless File.exist?(exe_path)
+
+  puts "Run #{label}".green
+  run_command([exe_path] + Shellwords.split(ENV.fetch("AUTODIFF_BENCH_ARGS", "")))
+end
+
 desc "show current configuration"
 task :info do
   print_configuration
 end
 
-desc "configure and install CppAd into ./lib or AUTODIFF_PREFIX"
-task :cppad do
+desc "configure and install Eigen5 into ./lib or AUTODIFF_PREFIX"
+task :eigen5 do
   print_configuration
   FileUtils.mkdir_p prefix_dir
+  build_component(:eigen5)
+end
+
+desc "configure and install CppAd into ./lib or AUTODIFF_PREFIX"
+task :cppad => :eigen5 do
   build_component(:cppad)
 end
 
@@ -231,9 +440,52 @@ task :cppadcg => :cppad do
   build_component(:cppadcg)
 end
 
-desc "build and install CppAd and CppAdCodegen into ./lib"
-task :build_common => :cppadcg do
+desc "configure TinyAD against local Eigen5 without building tests"
+task :tinyad_check => :eigen5 do
+  FileUtils.mkdir_p prefix_dir
+  configure_component(:tinyad)
 end
+
+desc "configure TinyAD against local Eigen5 and install headers into ./lib/include"
+task :tinyad => :tinyad_check do
+  FileUtils.mkdir_p prefix_dir
+  install_component(:tinyad)
+end
+
+desc "build and install Eigen5, CppAd, CppAdCodegen, and TinyAD into ./lib"
+task :build_common => [:cppadcg, :tinyad] do
+end
+
+desc "configure the local tests project against ./lib"
+task :tests_configure => :build_common do
+  configure_tests_project
+end
+
+desc "build the local tests project"
+task :tests_build => :build_common do
+  build_tests_project
+end
+
+desc "run the local gradient and hessian tests with ctest"
+task :tests => :build_common do
+  run_tests_project
+end
+
+desc "run the gradient benchmark executable directly"
+task :bench_gradient => :build_common do
+  run_benchmark
+end
+
+desc "run the hessian benchmark executable directly"
+task :bench_hessian => :build_common do
+  run_hessian_benchmark
+end
+
+desc "run both gradient and hessian benchmark executables"
+task :bench => [:bench_gradient, :bench_hessian] do
+end
+
+task :test => :tests do end
 
 desc "build and install for macOS"
 task :build_osx   => :build_common do end
@@ -271,9 +523,21 @@ task :clean_cppad do
   FileUtils.rm_rf component_build_dir(:cppad)
 end
 
+desc "remove Eigen5 build directory"
+task :clean_eigen5 do
+  FileUtils.rm_rf component_build_dir(:eigen5)
+end
+
 desc "remove CppAdCodegen build directory"
 task :clean_cppadcg do
   FileUtils.rm_rf component_build_dir(:cppadcg)
+end
+
+desc "remove tests build directory"
+task :clean_tests do
+  FileUtils.rm_rf tests_build_dir
+  FileUtils.rm_rf tests_codegen_gradient_dir
+  FileUtils.rm_rf tests_codegen_hessian_dir
 end
 
 task :clean_osx   => :clean do end
